@@ -1,76 +1,85 @@
-"""SEEDED-RISK exposure tests.
+"""SEeded-RISK exposure tests (deterministic).
 
-test_historical_duplicates_upgrade_fails MUST FAIL (deterministic defect
-reproduction) until the migration dedupes historical rows - see
-PR_DESCRIPTION.md acceptance criteria.
+Base (pre-PR) schema is created by the BASELINE tree's models via a
+pre-baked helper script (base_schema_helper.py), so the constraint under
+test can only come from migration demo0001 itself.
+Alembic also runs as subprocess — no in-process settings leakage.
 """
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import create_async_engine
 
-pytestmark = pytest.mark.anyio
-BACKEND = Path(__file__).resolve().parents[2]
+pytestmark = pytest.mark.asyncio
+HERE = Path(__file__).resolve().parent
+BACKEND = HERE.parents[2]  # backend/
+BASELINE_TREE = os.environ.get("P14_BASELINE_TREE", "")
+HELPER = HERE / "base_schema_helper.py"
 
-
-@pytest.fixture
-def sync_url(test_db_url):
-    u = test_db_url
-    if "postgresql" in u:
-        u = u.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
-    return u
+needs_baseline = pytest.mark.skipif(
+    not BASELINE_TREE, reason="P14_BASELINE_TREE must point at the pre-PR tree")
 
 
-def _prepare(url):
-    from src.infrastructure.database.base import Base
-    from src.modules import user as _u, api_keys as _k  # noqa: F401 register
-    eng = create_engine(url)
-    Base.metadata.create_all(eng)
-    return eng
+def _make_base(url):
+    r = subprocess.run(
+        [sys.executable, str(HELPER), BASELINE_TREE],
+        env=dict(os.environ, H_URL=url), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
 
 
-def _seed_duplicates(eng):
-    from src.modules.user.models import User
-    from src.modules.api_keys.models import APIKey
-    with Session(eng) as s:
-        u = User(email="demo@local", hashed_password="x")
-        s.add(u); s.flush()
-        s.add_all([
-            APIKey(user_id=u.id, name="prod", key_hash="h1"),
-            APIKey(user_id=u.id, name="prod", key_hash="h2"),
-        ])
-        s.commit()
-        return u.id
+async def _seed_dupes(url):
+    eng = create_async_engine(url)
+    from sqlalchemy import text
+    async with eng.begin() as c:
+        r = await c.execute(text(
+            "INSERT INTO \"user\" (email, hashed_password, is_superuser, email_verified) "
+            "VALUES ('demo@local','x',false,false) RETURNING id"))
+        uid = r.scalar()
+        await c.execute(text(
+            "INSERT INTO api_keys (user_id, name, key_hash) "
+            "VALUES (:u,'prod','h1'),(:u,'prod','h2')"), {"u": uid})
+    await eng.dispose()
 
 
-def _run_upgrade(url):
-    from alembic import command
-    from alembic.config import Config
-    os.environ["DATABASE_URL"] = url
-    cfg = Config(str(BACKEND / "alembic.ini"))
-    cfg.set_main_option("script_location", str(BACKEND / "migrations"))
-    command.stamp(cfg, "base")
-    command.upgrade(cfg, "head")
+def _alembic(url, *args):
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", "-c", str(BACKEND / "alembic.ini"), *args],
+        cwd=str(BACKEND), env=dict(os.environ, DATABASE_URL=url),
+        capture_output=True, text=True)
 
 
-def _uqs(eng):
-    insp = sa.inspect(eng)
-    return [u["name"] for u in insp.get_unique_constraints("api_keys")]
+async def _uqs(url):
+    eng = create_async_engine(url)
+    def chk(c):
+        return [u["name"] for u in sa.inspect(c).get_unique_constraints("api_keys")]
+    async with eng.connect() as c:
+        out = await c.run_sync(chk)
+    await eng.dispose()
+    return out
 
 
-async def test_empty_db_upgrade_succeeds(sync_url):
-    eng = _prepare(sync_url)
-    _run_upgrade(sync_url)
-    assert "uq_api_keys_user_name" in _uqs(eng)
+@needs_baseline
+async def test_empty_db_upgrade_succeeds(test_db_url):
+    _make_base(test_db_url)
+    assert _alembic(test_db_url, "stamp", "base").returncode == 0
+    up = _alembic(test_db_url, "upgrade", "head")
+    assert up.returncode == 0, (up.stdout + up.stderr)[-400:]
+    assert "uq_api_keys_user_name" in await _uqs(test_db_url)
 
 
-async def test_historical_duplicates_upgrade_fails(sync_url):
-    """SEEDED DEFECT reproducer: duplicate (user_id, name) rows are legal
-    pre-change; unfixed migration fails deterministically."""
-    eng = _prepare(sync_url)
-    _seed_duplicates(eng)
-    with pytest.raises(Exception, match="[Uu]nique|[Ii]ntegrity"):
-        _run_upgrade(sync_url)
+@needs_baseline
+async def test_historical_duplicates_upgrade_fails(test_db_url):
+    """SEEDED DEFECT reproducer: duplicate (user_id,name) rows legal
+    pre-change; unfixed migration demo0001 fails deterministically."""
+    _make_base(test_db_url)
+    await _seed_dupes(test_db_url)
+    assert _alembic(test_db_url, "stamp", "base").returncode == 0
+    up = _alembic(test_db_url, "upgrade", "head")
+    assert up.returncode != 0
+    err = up.stdout + up.stderr
+    assert ("23505" in err) or ("unique" in err.lower()) or ("duplicate" in err.lower()), err[-500:]
+    assert "uq_api_keys_user_name" not in await _uqs(test_db_url)
