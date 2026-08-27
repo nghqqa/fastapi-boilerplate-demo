@@ -7,7 +7,7 @@ permissions, and usage tracking for developer-facing products.
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,6 +36,7 @@ class APIKey(Base, TimestampMixin):
 
     __table_args__ = (
         Index("idx_api_keys_user_active", "user_id", "is_active"),
+        UniqueConstraint("user_id", "name", name="uq_api_keys_user_name"),
         Index("idx_api_keys_prefix", "key_prefix"),
         Index("idx_api_keys_expires_at", "expires_at"),
     )
