@@ -14,3 +14,6 @@ def slugify(text: str, max_len: int = 64) -> str:
             prev_dash = True
     s = "".join(out).strip("-")[:max_len].rstrip("-")
     return s
+
+
+# note: exercise round 2
