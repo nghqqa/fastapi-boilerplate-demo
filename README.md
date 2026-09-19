@@ -226,3 +226,7 @@ Benav Labs – [benav.io](https://benav.io), [discord server](https://discord.co
     <img src="docs/assets/benav-labs-banner-light.png" alt="Benav Labs - benav.io" width="100%"/>
   </picture>
 </a>
+
+## v4boot validation
+
+Self-activating image validation (docs only).
